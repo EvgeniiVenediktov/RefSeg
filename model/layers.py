@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from typing import List, Optional
-
+from linformer import Linformer
 
 def _get_activation_fn(activation):
     """Return an activation function given a string"""
@@ -42,9 +42,14 @@ class HA(nn.Module):
                  stride = [2, 1, 2], # [1, 1, 1] for vit
                  d_model = 512, nhead = 8):
         super(HA, self).__init__()
-        self.fusion3 = InteractorT(d_model=d_model, nhead=nhead)
-        self.fusion4 = InteractorT(d_model=d_model, nhead=nhead)
-        self.fusion5 = InteractorT(d_model=d_model, nhead=nhead)     
+        # self.fusion3 = InteractorT(d_model=d_model, nhead=nhead)
+        # self.fusion4 = InteractorT(d_model=d_model, nhead=nhead)
+        # self.fusion5 = InteractorT(d_model=d_model, nhead=nhead)     
+        
+        self.fusion3 = InteractorT2(d_model=d_model, nhead=nhead)
+        self.fusion4 = InteractorT2(d_model=d_model, nhead=nhead)
+        self.fusion5 = InteractorT2(d_model=d_model, nhead=nhead)     
+                     
         self.txt_proj = nn.Linear(in_channels[2], out_channels[1])   
         self.f3_proj = conv_layer(in_channels[0], out_channels[1], stride[0], 0, stride[0])
         self.f4_proj = conv_layer(in_channels[1], out_channels[1], stride[1], 0, stride[1])
@@ -63,31 +68,84 @@ class HA(nn.Module):
         v4 = self.f4_proj(v4)
         v5 = self.f5_proj(v5)
         txt = self.txt_proj(txt)
-        # fusion v3 
-        b, c, h, w = v3.shape
-        v3 = v3.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c
-        # print(v3.shape, txt.shape)
-        fq3 = self.fusion3(v3, txt)        
-        fq3 = fq3.permute(1, 2, 0).reshape(b, c, h, w)
-        # fusion v4 
-        b, c, h, w = v4.shape
-        v4 = v4.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c     
-        # v4 = self.downsample(v4)
-        fq4 = self.fusion4(v4, txt)        
-        fq4 = fq4.permute(1, 2, 0).reshape(b, c, h, w)
-        # fusion v5 
-        b, c, h, w = v5.shape
-        v5 = v5.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c       
-        fq5 = self.fusion5(v5, txt)
-        fq5 = fq5.permute(1, 2, 0).reshape(b, c, h, w)
-        # fusion 4: b, 512, 26, 26 / b, 512, 26, 26 / b, 512, 26, 26
+
+        
+        # # fusion v3 
+        # b, c, h, w = v3.shape
+       
+        # v3 = v3.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c
+        # # print(v3.shape, txt.shape)
+        # fq3 = self.fusion3(v3, txt)        
+        # fq3 = fq3.permute(1, 2, 0).reshape(b, c, h, w)
+        # # fusion v4 
+        # b, c, h, w = v4.shape
+        # v4 = v4.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c     
+        # # v4 = self.downsample(v4)
+        # fq4 = self.fusion4(v4, txt)        
+        # fq4 = fq4.permute(1, 2, 0).reshape(b, c, h, w)
+        # # fusion v5 
+        # b, c, h, w = v5.shape
+        # v5 = v5.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c       
+        # fq5 = self.fusion5(v5, txt)
+        # fq5 = fq5.permute(1, 2, 0).reshape(b, c, h, w)
+        # # fusion 4: b, 512, 26, 26 / b, 512, 26, 26 / b, 512, 26, 26
+        # # query
+        # fq = torch.cat([fq3, fq4, fq5], dim=1)
+        # fq = self.aggr(fq)
+
+         ############ fusion ############
+        fq3 = self.fusion3(v3.reshape(v3.shape[0], v3.shape[1], -1).permute(2, 0, 1), txt)
+        # print(f"fq3 shape before slicing: {fq3.shape}")
+        fq3 = fq3[:676, :, :] 
+        fq3 = fq3.permute(1, 2, 0).reshape(v3.shape[0], v3.shape[1], v3.shape[2], v3.shape[3])
+
+        # Fusion v4
+        fq4 = self.fusion4(v4.reshape(v4.shape[0], v4.shape[1], -1).permute(2, 0, 1), txt)
+        # print(f"fq4 shape before slicing: {fq4.shape}")  
+        fq4 = fq4[:676, :, :]  
+        fq4 = fq4.permute(1, 2, 0).reshape(v4.shape[0], v4.shape[1], v4.shape[2], v4.shape[3])
+
+        # Fusion v5
+        fq5 = self.fusion5(v5.reshape(v5.shape[0], v5.shape[1], -1).permute(2, 0, 1), txt)
+        fq5 = fq5[:676, :, :]
+        fq5 = fq5.permute(1, 2, 0).reshape(v5.shape[0], v5.shape[1], v5.shape[2], v5.shape[3])
+
         # query
         fq = torch.cat([fq3, fq4, fq5], dim=1)
         fq = self.aggr(fq)
+
+        
         fq = self.coordconv(fq)
         # b, 512, 26, 26
         return fq
 
+###################################################################
+###################################################################
+class DynamicPositionalEncoding(nn.Module):
+    def __init__(self, d_model, height, width):
+        """
+        Args:
+            d_model: Feature dimension
+            height: Height of the positional encoding
+            width: Width of the positional encoding
+        """
+        super(DynamicPositionalEncoding, self).__init__()
+        self.height = height
+        self.width = width
+        self.position_embedding = nn.Parameter(torch.zeros(1, d_model, height, width))
+        nn.init.xavier_uniform_(self.position_embedding)  
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, d_model, height, width)
+        Returns:
+            Tensor with positional encoding added
+        """
+        return x + self.position_embedding
+
+###################################################################
+###################################################################
 
 class CoordConv(nn.Module):
     def __init__(self,
@@ -176,6 +234,9 @@ class GA(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.return_intermediate = return_intermediate
 
+        self.vis_pos_enc = DynamicPositionalEncoding(d_model, height=26, width=26)
+        self.txt_pos_enc = DynamicPositionalEncoding(d_model, height=1, width=1)
+
     @staticmethod
     def pos1d(d_model, length):
         """
@@ -232,6 +293,13 @@ class GA(nn.Module):
         '''
         B, C, H, W = vis.size()
         _, L, D = txt.size()
+
+        ##############################################################################
+        # DynamicPositionalEncoding 
+        vis = self.vis_pos_enc(vis)
+        txt = self.txt_pos_enc(txt.unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1)
+        ##############################################################################
+        
         # position encoding
         vis_pos = self.pos2d(C, H, W)
         txt_pos = self.pos1d(D, L)
@@ -242,7 +310,8 @@ class GA(nn.Module):
         output = vis
         intermediate = []
         for layer in self.layers:
-            output = layer(output, txt, vis_pos, txt_pos, pad_mask)
+            # output = layer(output, txt, vis_pos, txt_pos, pad_mask)
+            output = layer(output, txt, None, None, pad_mask)
             if self.return_intermediate:
                 # HW, b, 512 -> b, 512, HW
                 intermediate.append(self.norm(output).permute(1, 2, 0))
@@ -321,6 +390,41 @@ class GALayer(nn.Module):
         vis2 = self.ffn(vis2)
         vis = vis + self.dropout3(vis2)
         return vis
+
+
+############################
+############################
+
+class InteractorT2(nn.Module):
+    def __init__(self, d_model, nhead, seq_len=512, k=64, dropout=0.1):
+        super().__init__()
+        self.multihead_attn = Linformer(
+            dim=d_model,
+            seq_len=seq_len,
+            depth=1,
+            heads=nhead,
+            k=k,
+            dropout=dropout
+        )
+        self.dim = d_model
+
+    def forward(self, tgt, memory=None):
+        # print('tgt -> shape', tgt.shape) # 676, 32, 512
+        # print('d_model', self.dim)
+        # print(f"tgt shape: {tgt.shape}")
+        # print(f"memory shape: {memory.shape}")
+
+        if memory is not None:
+            combined_input = torch.cat([tgt, memory], dim=0) 
+        else:
+            combined_input = tgt
+
+        output = self.multihead_attn(combined_input)  
+        return output
+
+
+############################
+############################
 
 
 class InteractorT(nn.Module):
