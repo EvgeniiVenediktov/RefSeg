@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import wandb
 from loguru import logger
 from utils.dataset import tokenize
+import loratorch as lora
 from utils.misc import (AverageMeter, ProgressMeter, concat_all_gather,
                         trainMetricGPU)
 
@@ -48,6 +49,9 @@ def train(train_loader, model, optimizer, scheduler, scaler, epoch, args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
         scaler.step(optimizer)
         scaler.update()
+
+        # make sure LoRA weights are updated
+        lora.register_model_param_after_backward(model)
 
         # metric
         iou, pr5 = trainMetricGPU(pred, target, 0.35, 0.5)

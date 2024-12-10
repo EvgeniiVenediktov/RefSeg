@@ -37,7 +37,7 @@ def get_parser():
     return cfg
 
 
-DEFAULT_LORA_WEIGHTS = True
+DEFAULT_LORA_WEIGHTS = False
 
 @logger.catch
 def main():

@@ -166,7 +166,7 @@ def main_worker(gpu, args):
             checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint['epoch']
             best_IoU = checkpoint["best_iou"]
-            model.load_state_dict(checkpoint['state_dict'])
+            model.load_state_dict(checkpoint['state_dict'], strict=False)
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
             logger.info("=> loaded checkpoint '{}' (epoch {})".format(

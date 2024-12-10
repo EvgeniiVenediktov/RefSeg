@@ -1,5 +1,5 @@
 wandb
-numpy
+numpy==1.26.3
 lmdb
 pyarrow==11.0.0
 regex

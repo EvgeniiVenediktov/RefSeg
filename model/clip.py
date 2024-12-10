@@ -250,7 +250,7 @@ class ResidualAttentionBlock(nn.Module):
             lora_rank = d_model // 2
         
         # self.attn = nn.MultiheadAttention(d_model, n_head)
-        # LoRA - modified Multihead Attention
+        # LoRA-modified Multihead Attention
         self.attn = lora.MultiheadAttention(d_model, n_head, r=lora_rank, lora_alpha=lora_alpha)
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(
