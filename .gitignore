@@ -143,3 +143,9 @@ datasets/*
 pretrain/
 exp/*
 wandb/*
+
+bin/
+datasets.zip
+lib64
+pyvenv.cfg
+share/

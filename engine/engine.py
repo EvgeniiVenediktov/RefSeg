@@ -138,9 +138,11 @@ def validate(val_loader, model, epoch, args):
 
 @torch.no_grad()
 def inference(test_loader, model, args):
+    logger.info("Entered validate")
     iou_list = []
     tbar = tqdm(test_loader, desc='Inference:', ncols=100)
     model.eval()
+    logger.info("Switched model to eval")
     time.sleep(2)
     for img, param in tbar:
         # data
