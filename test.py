@@ -37,6 +37,8 @@ def get_parser():
     return cfg
 
 
+DEFAULT_LORA_WEIGHTS = True
+
 @logger.catch
 def main():
     args = get_parser()
@@ -77,7 +79,10 @@ def main():
     if os.path.isfile(args.model_dir):
         logger.info("=> loading checkpoint '{}'".format(args.model_dir))
         checkpoint = torch.load(args.model_dir)
-        model.load_state_dict(checkpoint['state_dict'], strict=True)
+        checkpoint_dict = checkpoint['state_dict']
+        if DEFAULT_LORA_WEIGHTS: # Load only original weights, leaving default LoRA weights
+            checkpoint_dict = {k:v for k, v in checkpoint.items() if not '_lora_' in k}
+        model.load_state_dict(checkpoint_dict, strict=True)
         logger.info("=> loaded checkpoint '{}'".format(args.model_dir))
     else:
         raise ValueError(

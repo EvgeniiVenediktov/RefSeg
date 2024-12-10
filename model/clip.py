@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+import loratorch as lora
 
 
 class Bottleneck(nn.Module):
@@ -240,10 +241,17 @@ class ResidualAttentionBlock(nn.Module):
     def __init__(self,
                  d_model: int,
                  n_head: int,
-                 attn_mask: torch.Tensor = None):
+                 attn_mask: torch.Tensor = None,
+                 lora_rank: int = None,
+                 lora_alpha: float = 1):
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
+        if lora_rank is None:
+            lora_rank = d_model // 2
+        
+        # self.attn = nn.MultiheadAttention(d_model, n_head)
+        # LoRA - modified Multihead Attention
+        self.attn = lora.MultiheadAttention(d_model, n_head, r=lora_rank, lora_alpha=lora_alpha)
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(
             OrderedDict([("c_fc", nn.Linear(d_model, d_model * 4)),
