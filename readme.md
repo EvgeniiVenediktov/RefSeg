@@ -1,6 +1,8 @@
-https://www.overleaf.com/project/66ef3c0c7a071842be27fa15
+Final Report - https://www.overleaf.com/project/6758b1ffde51eee9e8b58f39
 
-ETRIS source code: https://github.com/kkakkkka/ETRIS
+Base model - ETRIS source code: https://github.com/kkakkkka/ETRIS
+
+Running instructions are the same as for ETRIS and stated on its github page. There are some special instructions for LoRA and Cross-Modal Fusion extensions that are specified in respective branches.
 
 Branches and extensions:
 - **main** - ```Task Specific Decoder by Sanga Park```
