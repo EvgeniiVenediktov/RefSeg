@@ -1,3 +1,5 @@
+# Efficient and Accurate Referring Image Segmentation
+
 Final Report - https://www.overleaf.com/project/6758b1ffde51eee9e8b58f39
 
 Base model - ETRIS source code: https://github.com/kkakkkka/ETRIS
