@@ -10,4 +10,4 @@ Branches and extensions:
 - **selective-feature-adaptation** - ```Selective Feature Adaptation by Uma Sharma```
   - the SelectiveAdaptationLayer replaces InteractorT in layers.py. SelectiveAdaptationLayer is used instead of InteractorT in the HA l(Heirarchical Alignment) layers. Run details are the same as ETRIS main code.
 - **hyunwoo** - ```Cross-Modal Fusion by Hyunwoo Yu```
-  - Cross-Modal Fusion
+  - The proposed method is designed with a structure that receives multi-modal features in the encoder and fuses target-informative information. This is implemented in lib/decoder.py.
