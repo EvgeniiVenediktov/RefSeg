@@ -1,227 +1,319 @@
-import argparse
 import datetime
 import os
-import shutil
-import sys
 import time
-import warnings
-import random
-from functools import partial
 
-import cv2
 import torch
-import torch.cuda.amp as amp
-import torch.distributed as dist
-import torch.multiprocessing as mp
-import torch.nn as nn
-import torch.nn.parallel
-import torch.optim
-import torch.utils.data as data
-from loguru import logger
-from torch.optim.lr_scheduler import MultiStepLR
+import torch.utils.data
+from torch import nn
+import random
+from functools import reduce
+import operator
 
-import utils.config as config
-import wandb
-from utils.dataset import RefDataset
-from engine.engine import train, validate
-from model import build_segmenter
-from utils.misc import (init_random_seed, set_random_seed, setup_logger,
-                        worker_init_fn)
+from lib import segmentation
 
-warnings.filterwarnings("ignore")
-cv2.setNumThreads(0)
+import transforms as T
+import utils
+import numpy as np
 
+import torch.nn.functional as F
 
-def get_parser():
-    parser = argparse.ArgumentParser(
-        description='Pytorch Referring Expression Segmentation')
-    parser.add_argument('--config',
-                        default='path to xxx.yaml',
-                        type=str,
-                        help='config file')
-    parser.add_argument('--opts',
-                        default=None,
-                        nargs=argparse.REMAINDER,
-                        help='override some settings in the config.')
+import gc
+from collections import OrderedDict
 
-    args = parser.parse_args()
-    assert args.config is not None
-    cfg = config.load_cfg_from_cfg_file(args.config)
-    if args.opts is not None:
-        cfg = config.merge_cfg_from_list(cfg, args.opts)
-    return cfg
+def get_dataset(image_set, transform, args, eval_mode=False):
+    from data.dataset_ import ReferDataset
+    ds = ReferDataset(args,
+                      split=image_set,
+                      image_transforms=transform,
+                      target_transforms=None,
+                      eval_mode=eval_mode
+                      )
+    num_classes = 2
 
+    return ds, num_classes
 
-@logger.catch
-def main():
-    args = get_parser()
-    args.manual_seed = init_random_seed(args.manual_seed)
-    set_random_seed(args.manual_seed, deterministic=False)
+ 
+# IoU calculation for validation
+def IoU(pred, gt):
+    pred = pred.argmax(1)
 
-    args.ngpus_per_node = torch.cuda.device_count()
-    args.world_size = args.ngpus_per_node * args.world_size
-    mp.spawn(main_worker, nprocs=args.ngpus_per_node, args=(args, ))
+    intersection = torch.sum(torch.mul(pred, gt))
+    union = torch.sum(torch.add(pred, gt)) - intersection
+
+    if intersection == 0 or union == 0:
+        iou = 0
+    else:
+        iou = float(intersection) / float(union)
+
+    return iou, intersection, union
 
 
-def main_worker(gpu, args):
-    args.exp_name = '_'.join([args.exp_name] + [str(name) for name in [args.ladder_dim, args.nhead, args.dim_ffn, args.multi_stage]])
+def get_transform(args):
+    transforms = [T.Resize(args.img_size, args.img_size),
+                  T.ToTensor(),
+                  T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                  ]
+
+    return T.Compose(transforms)
+
+
+def criterion(input, target):
+    weight = torch.FloatTensor([0.9, 1.1]).cuda()
+    return nn.functional.cross_entropy(input, target, weight=weight)
+
+
+def evaluate(model, data_loader):
+    model.eval()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Test:'
+    total_its = 0
+    acc_ious = 0
+
+    # evaluation variables
+    cum_I, cum_U = 0, 0
+    eval_seg_iou_list = [.5, .6, .7, .8, .9]
+    seg_correct = np.zeros(len(eval_seg_iou_list), dtype=np.int32)
+    seg_total = 0
+    mean_IoU = []
+
+    with torch.no_grad():
+        for data in metric_logger.log_every(data_loader, 100, header):
+            total_its += 1
+            image, target, sentences, attentions,_,_ = data
+            image, target, sentences, attentions = image.cuda(non_blocking=True),\
+                                                   target.cuda(non_blocking=True),\
+                                                   sentences.cuda(non_blocking=True),\
+                                                   attentions.cuda(non_blocking=True)
+
+            sentences = sentences.squeeze(1)
+            attentions = attentions.squeeze(1)
+
+            for j in range(sentences.size(-1)):
+                output = model(image, sentences[:,:,j], attentions[:,:,j], training=False)
+
+                iou, I, U = IoU(output, target)
+                acc_ious += iou
+                mean_IoU.append(iou)
+                cum_I += I
+                cum_U += U
+                for n_eval_iou in range(len(eval_seg_iou_list)):
+                    eval_seg_iou = eval_seg_iou_list[n_eval_iou]
+                    seg_correct[n_eval_iou] += (iou >= eval_seg_iou)
+                seg_total += 1
+        iou = acc_ious / total_its
+
+    mean_IoU = np.array(mean_IoU)
+    mIoU = np.mean(mean_IoU)
+    print('Final results:')
+    print('Mean IoU is %.2f\n' % (mIoU * 100.))
+    results_str = ''
+    for n_eval_iou in range(len(eval_seg_iou_list)):
+        results_str += '    precision@%s = %.2f\n' % \
+                       (str(eval_seg_iou_list[n_eval_iou]), seg_correct[n_eval_iou] * 100. / seg_total)
+    results_str += '    overall IoU = %.2f\n' % (cum_I * 100. / cum_U)
+    print(results_str)
+
+    return 100 * mIoU, 100 * cum_I / cum_U
     
-    args.output_dir = os.path.join(args.output_folder, args.exp_name)
+def minmax_scale(input):
+  min_val = np.min(input)
+  max_val=np.max(input)
+  out = (input-min_val)/(max_val-min_val)
+  return out
 
-    # local rank & global rank
-    args.gpu = gpu
-    args.rank = args.rank * args.ngpus_per_node + gpu
-    torch.backends.cudnn.enabled = False
-    torch.cuda.set_device(args.gpu)
+def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, epoch, print_freq,
+                    iterations, best_oIoU, cont_loss):
+    model.train()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    train_loss = 0
+    total_its = 0
+
+    for data in metric_logger.log_every(data_loader, print_freq, header):
+        
+        total_its += 1
+
+        image, target, sentences, attentions = data
+        image, target, sentences, attentions = image.cuda(non_blocking=True),\
+                                               target.cuda(non_blocking=True),\
+                                               sentences.cuda(non_blocking=True),\
+                                               attentions.cuda(non_blocking=True)
+        
+        H, W = image.shape[-2], image.shape[-1]
+        l = sentences.shape[-1]
+        image = image.reshape(-1, 3, H, W)
+        target = target.reshape(-1, H, W)         
+        sentences = sentences.reshape(-1, 1, l)
+        attentions = attentions.reshape(-1, 1, l)
+        sentences = sentences.squeeze(1)
+        attentions = attentions.squeeze(1)
+        
+        out, s = model(image, sentences, attentions)
     
+        loss1 = 2*criterion(out, target.detach())
+        loss2 = 0.4*cont_loss(s, target.detach())
+        loss = loss1 + loss2 
+        optimizer.zero_grad() 
+        loss.backward()
+        optimizer.step()
+        lr_scheduler.step()
 
-    # logger
-    setup_logger(args.output_dir,
-                 distributed_rank=args.gpu,
-                 filename="train.log",
-                 mode="a")
+        torch.cuda.synchronize()
+        train_loss += loss.item()
+        iterations += 1
+        
+        metric_logger.update(loss=loss.item(),   lr=optimizer.param_groups[0]["lr"]) #
+        torch.cuda.synchronize()
+    
+    return best_oIoU
 
-    # dist init
-    # dist.init_process_group(backend=args.dist_backend,
-    #                         # init_method=args.dist_url,
-    #                         init_method=f'tcp://localhost:{random.randint(6000, 7000)}',
-    #                         world_size=args.world_size,
-    #                         rank=args.rank,)
-    dist.init_process_group(backend=args.dist_backend,
-                            init_method=args.dist_url,
-                            world_size=args.world_size,
-                            rank=args.rank)
-    # wandb
-    if args.rank == 0:
-        wandb.init(job_type="training",
-                   mode="offline",
-                   config=args,
-                   project="ETRIS",
-                   name=args.exp_name,
-                   tags=[args.dataset, args.clip_pretrain])
-    dist.barrier()
+    
+class AlignLoss(nn.Module):
+    def __init__(self):
+        super(AlignLoss, self).__init__()
+        self.loss = nn.BCEWithLogitsLoss(reduction='mean')        
+        
+    def forward(self, m, target):
 
-    # build model
-    model, param_list = build_segmenter(args)
-    if args.sync_bn:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    logger.info(model)
-    model = nn.parallel.DistributedDataParallel(model.cuda(),
-                                                device_ids=[args.gpu],
-                                                find_unused_parameters=False)
-                                                # find_unused_parameters=True)
+        loss = self.loss(m, target.float())
+        
+        return loss
 
-    # build optimizer & lr scheduler
-    optimizer = torch.optim.Adam(param_list, lr=args.base_lr, weight_decay=args.weight_decay)
-    scheduler = MultiStepLR(optimizer, milestones=args.milestones, gamma=args.lr_decay)
-    scaler = amp.GradScaler()
+def main(args):
+    dataset, num_classes = get_dataset("train",
+                                       get_transform(args=args),
+                                       args=args)
+    dataset_test, _ = get_dataset("val",
+                                  get_transform(args=args),
+                                  args=args, eval_mode=True)
+    
+    # batch sampler
+    print(f"local rank {args.local_rank} / global rank {utils.get_rank()} successfully built train dataset.")
+    num_tasks = utils.get_world_size()
+    global_rank = utils.get_rank()
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset, num_replicas=num_tasks, rank=global_rank,
+                                                                    shuffle=True)
+    test_sampler = torch.utils.data.SequentialSampler(dataset_test)
 
-    # build dataset
-    args.batch_size = int(args.batch_size / args.ngpus_per_node)
-    args.batch_size_val = int(args.batch_size_val / args.ngpus_per_node)
-    args.workers = int((args.workers + args.ngpus_per_node - 1) / args.ngpus_per_node)
-    train_data = RefDataset(lmdb_dir=args.train_lmdb,
-                            mask_dir=args.mask_root,
-                            dataset=args.dataset,
-                            split=args.train_split,
-                            mode='train',
-                            input_size=args.input_size,
-                            word_length=args.word_len)
-    val_data = RefDataset(lmdb_dir=args.val_lmdb,
-                          mask_dir=args.mask_root,
-                          dataset=args.dataset,
-                          split=args.val_split,
-                          mode='val',
-                          input_size=args.input_size,
-                          word_length=args.word_len)
+    # data loader
+    data_loader = torch.utils.data.DataLoader(
+        dataset, batch_size=args.batch_size, 
+        sampler=train_sampler, num_workers=args.workers, pin_memory=args.pin_mem, drop_last=True)
+    print(data_loader.__len__())
+    
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test, batch_size=1, sampler=test_sampler, num_workers=args.workers)
 
-    # build dataloader
-    init_fn = partial(worker_init_fn,
-                      num_workers=args.workers,
-                      rank=args.rank,
-                      seed=args.manual_seed)
-    train_sampler = data.distributed.DistributedSampler(train_data, shuffle=True)
-    val_sampler = data.distributed.DistributedSampler(val_data, shuffle=False)
-    train_loader = data.DataLoader(train_data,
-                                   batch_size=args.batch_size,
-                                   shuffle=False,
-                                   num_workers=args.workers,
-                                   pin_memory=True,
-                                   worker_init_fn=init_fn,
-                                   sampler=train_sampler,
-                                   drop_last=True)
-    val_loader = data.DataLoader(val_data,
-                                 batch_size=args.batch_size_val,
-                                 shuffle=False,
-                                 num_workers=args.workers_val,
-                                 pin_memory=True,
-                                 sampler=val_sampler,
-                                 drop_last=False)
+    # model initialization
+    print(args.model)
 
-    best_IoU = 0.0
-    # resume
+    model = segmentation.__dict__[args.model](pretrained=args.pretrained_swin_weights,
+                                              args=args)
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model.cuda()
+    
+    
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], find_unused_parameters=True)
+    single_model = model.module
+
+    best_oIoU = -1
+    # resume training
     if args.resume:
-        if os.path.isfile(args.resume):
-            logger.info("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
-            args.start_epoch = checkpoint['epoch']
-            best_IoU = checkpoint["best_iou"]
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['scheduler'])
-            logger.info("=> loaded checkpoint '{}' (epoch {})".format(
-                args.resume, checkpoint['epoch']))
-        else:
-            raise ValueError(
-                "=> resume failed! no checkpoint found at '{}'. Please check args.resume again!"
-                .format(args.resume))
+        checkpoint = torch.load(args.resume, map_location='cuda')
+        single_model.load_state_dict(checkpoint['model'])
+        best_oIoU = checkpoint['best_oIoU']
+        del checkpoint
 
-    # start training
+
+    # parameters to optimize
+    backbone_no_decay = list()
+    backbone_decay = list()
+    net_decay = list()
+    for name, m in single_model.backbone.named_parameters():
+            if 'norm' in name or 'absolute_pos_embed' in name or 'relative_position_bias_table' in name:
+                backbone_no_decay.append(m)
+            else:
+                backbone_decay.append(m)
+
+    for name, m in single_model.net.named_parameters():
+        if 'QLformer.embeddings.' in name:
+            m.requires_grad = False
+        
+    for name, m in single_model.net.named_parameters():
+        if m.requires_grad:
+            net_decay.append(m)
+            
+    
+    for name, m in single_model.text_encoder.named_parameters():
+        if '.embeddings.' in name:
+            m.requires_grad = False
+  
+    params_to_optimize = [
+        {'params': backbone_no_decay, 'weight_decay': 0.0, },
+        {'params': backbone_decay},
+        {'params': net_decay},
+        {"params": [p for p in single_model.text_encoder.parameters() if p.requires_grad]}, 
+    ]
+    
+    # optimizer
+    optimizer = torch.optim.AdamW(params_to_optimize,
+                                  lr=args.lr,
+                                  weight_decay=args.weight_decay,
+                                  amsgrad=args.amsgrad
+                                  )
+
+    # learning rate scheduler
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, 
+                                                     lambda x: (1 - x / (len(data_loader) * args.epochs)) ** 0.9)
+
+    # housekeeping
     start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
-        epoch_log = epoch + 1
+    iterations = 0
+    
+    resume_epoch = -999
+    cont_criterion = AlignLoss().cuda()
+    torch.cuda.empty_cache()
+    # training loops
+    for epoch in range(max(0, resume_epoch+1), args.epochs):
+        data_loader.sampler.set_epoch(epoch)
 
-        # shuffle loader
-        train_sampler.set_epoch(epoch_log)
+        best_oIoU = train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, epoch, args.print_freq,
+                        iterations, best_oIoU, cont_criterion)
 
-        # train
-        train(train_loader, model, optimizer, scheduler, scaler, epoch_log, args)
+        iou, overallIoU = evaluate(model, data_loader_test)
 
-        # evaluation
-        iou, prec_dict = validate(val_loader, model, epoch_log, args)
+        print('Average object IoU {}'.format(iou))
+        print('Overall IoU {}'.format(overallIoU))
+        save_checkpoint = (best_oIoU < overallIoU)
+        if save_checkpoint:
+            print('Better epoch: {}\n'.format(epoch))
+            best_oIoU = overallIoU
+            dict_to_save = {'model': single_model.state_dict(), 'best_oIoU': best_oIoU,
+                                 'epoch': epoch, 'args': args,
+                                }
 
-        # save model
-        if dist.get_rank() == 0:
-            lastname = os.path.join(args.output_dir, "last_model.pth")
-            torch.save(
-                {
-                    'epoch': epoch_log,
-                    'cur_iou': iou,
-                    'best_iou': best_IoU,
-                    'prec': prec_dict,
-                    'state_dict': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict()
-                }, lastname)
-            if iou >= best_IoU:
-                best_IoU = iou
-                bestname = os.path.join(args.output_dir, "best_model.pth")
-                shutil.copyfile(lastname, bestname)
+            utils.save_on_master(dict_to_save, os.path.join(args.output_dir,
+                                                            'model_best_refcoco.pth'))
+          
 
-        # update lr
-        scheduler.step(epoch_log)
-        torch.cuda.empty_cache()
-
-    time.sleep(2)
-    if dist.get_rank() == 0:
-        wandb.finish()
-
-    logger.info("* Best IoU={} * ".format(best_IoU))
+    # summarize
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info('* Training time {} *'.format(total_time_str))
+    print('Training time {}'.format(total_time_str))
 
 
-if __name__ == '__main__':
-    main()
-    sys.exit(0)
+if __name__ == "__main__":
+    from args import get_parser
+    parser = get_parser()
+    args = parser.parse_args()
+    # set up distributed learning
+    print("local rank = ",args.local_rank)
+    utils.init_distributed_mode(args)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    print('Image size: {}'.format(str(args.img_size)))
+    main(args)
