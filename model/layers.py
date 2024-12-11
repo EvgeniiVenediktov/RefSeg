@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from typing import List, Optional
-from linformer import Linformer
+
 
 def _get_activation_fn(activation):
     """Return an activation function given a string"""
@@ -35,33 +35,40 @@ def linear_layer(in_dim, out_dim, bias=False):
                          nn.BatchNorm1d(out_dim), nn.ReLU(True))
 
 
+class SelectiveAdaptation(nn.Module):
+    def __init__(self, d_model, nhead, dropout=0.0):
+        super(SelectiveAdaptation, self).__init__()
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.adaptive_layer = nn.Linear(d_model, d_model)
+        self.gate_layer = nn.Linear(d_model, d_model)  # Gating mechanism
+
+    def forward(self, x, memory):
+        # Perform selective adaptation: gating mechanism before adaptation
+        gate = torch.sigmoid(self.gate_layer(x))  # Learn a gating signal for adaptation
+        x = self.adaptive_layer(x) * gate  # Apply gated adaptation
+        tgt2 = self.multihead_attn(query=x, key=memory, value=memory)[0]
+        return tgt2
+
+
+
 class HA(nn.Module):
-    def __init__(self,
-                 in_channels=[512, 1024, 1024],
-                 out_channels=[256, 512, 1024],
-                 stride = [2, 1, 2], # [1, 1, 1] for vit
-                 d_model = 512, nhead = 8):
+    def __init__(self, in_channels=[512, 1024, 1024], out_channels=[256, 512, 1024], stride=[2, 1, 2], d_model=512, nhead=8):
         super(HA, self).__init__()
-        # self.fusion3 = InteractorT(d_model=d_model, nhead=nhead)
-        # self.fusion4 = InteractorT(d_model=d_model, nhead=nhead)
-        # self.fusion5 = InteractorT(d_model=d_model, nhead=nhead)     
-        
-        self.fusion3 = InteractorT2(d_model=d_model, nhead=nhead)
-        self.fusion4 = InteractorT2(d_model=d_model, nhead=nhead)
-        self.fusion5 = InteractorT2(d_model=d_model, nhead=nhead)     
-                     
-        self.txt_proj = nn.Linear(in_channels[2], out_channels[1])   
+        # Use the SelectiveAdaptation layer instead of InteractorT
+        self.fusion3 = SelectiveAdaptation(d_model=d_model, nhead=nhead)
+        self.fusion4 = SelectiveAdaptation(d_model=d_model, nhead=nhead)
+        self.fusion5 = SelectiveAdaptation(d_model=d_model, nhead=nhead)
+        self.txt_proj = nn.Linear(in_channels[2], out_channels[1])
         self.f3_proj = conv_layer(in_channels[0], out_channels[1], stride[0], 0, stride[0])
         self.f4_proj = conv_layer(in_channels[1], out_channels[1], stride[1], 0, stride[1])
         self.f5_proj = deconv_layer(in_channels[2], out_channels[1], stride[2], 0, stride[2])
-        # aggregation
+        # Aggregation and CoordConv layers
         self.aggr = conv_layer(3 * out_channels[1], out_channels[1], 1, 0)
         self.coordconv = nn.Sequential(
             CoordConv(out_channels[1], out_channels[1], 3, 1),
             conv_layer(out_channels[1], out_channels[1], 3, 1))
 
     def forward(self, imgs, state):
-        # v3, v4, v5: 512, 52, 52 / 1024, 26, 26 / 512, 13, 13
         v3, v4, v5 = imgs
         txt = state.unsqueeze(-1).permute(2, 0, 1)
         v3 = self.f3_proj(v3)
@@ -69,83 +76,86 @@ class HA(nn.Module):
         v5 = self.f5_proj(v5)
         txt = self.txt_proj(txt)
 
-        
-        # # fusion v3 
-        # b, c, h, w = v3.shape
-       
-        # v3 = v3.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c
-        # # print(v3.shape, txt.shape)
-        # fq3 = self.fusion3(v3, txt)        
-        # fq3 = fq3.permute(1, 2, 0).reshape(b, c, h, w)
-        # # fusion v4 
-        # b, c, h, w = v4.shape
-        # v4 = v4.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c     
-        # # v4 = self.downsample(v4)
-        # fq4 = self.fusion4(v4, txt)        
-        # fq4 = fq4.permute(1, 2, 0).reshape(b, c, h, w)
-        # # fusion v5 
-        # b, c, h, w = v5.shape
-        # v5 = v5.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c       
-        # fq5 = self.fusion5(v5, txt)
-        # fq5 = fq5.permute(1, 2, 0).reshape(b, c, h, w)
-        # # fusion 4: b, 512, 26, 26 / b, 512, 26, 26 / b, 512, 26, 26
-        # # query
-        # fq = torch.cat([fq3, fq4, fq5], dim=1)
-        # fq = self.aggr(fq)
-
-         ############ fusion ############
-        fq3 = self.fusion3(v3.reshape(v3.shape[0], v3.shape[1], -1).permute(2, 0, 1), txt)
-        # print(f"fq3 shape before slicing: {fq3.shape}")
-        fq3 = fq3[:676, :, :] 
-        fq3 = fq3.permute(1, 2, 0).reshape(v3.shape[0], v3.shape[1], v3.shape[2], v3.shape[3])
+        # Fusion v3
+        b, c, h, w = v3.shape
+        v3 = v3.reshape(b, c, -1).permute(2, 0, 1)
+        fq3 = self.fusion3(v3, txt)        
+        fq3 = fq3.permute(1, 2, 0).reshape(b, c, h, w)
 
         # Fusion v4
-        fq4 = self.fusion4(v4.reshape(v4.shape[0], v4.shape[1], -1).permute(2, 0, 1), txt)
-        # print(f"fq4 shape before slicing: {fq4.shape}")  
-        fq4 = fq4[:676, :, :]  
-        fq4 = fq4.permute(1, 2, 0).reshape(v4.shape[0], v4.shape[1], v4.shape[2], v4.shape[3])
+        b, c, h, w = v4.shape
+        v4 = v4.reshape(b, c, -1).permute(2, 0, 1)
+        fq4 = self.fusion4(v4, txt)
+        fq4 = fq4.permute(1, 2, 0).reshape(b, c, h, w)
 
         # Fusion v5
-        fq5 = self.fusion5(v5.reshape(v5.shape[0], v5.shape[1], -1).permute(2, 0, 1), txt)
-        fq5 = fq5[:676, :, :]
-        fq5 = fq5.permute(1, 2, 0).reshape(v5.shape[0], v5.shape[1], v5.shape[2], v5.shape[3])
+        b, c, h, w = v5.shape
+        v5 = v5.reshape(b, c, -1).permute(2, 0, 1)
+        fq5 = self.fusion5(v5, txt)
+        fq5 = fq5.permute(1, 2, 0).reshape(b, c, h, w)
 
-        # query
+        # Aggregation
         fq = torch.cat([fq3, fq4, fq5], dim=1)
         fq = self.aggr(fq)
-
-        
         fq = self.coordconv(fq)
-        # b, 512, 26, 26
+
         return fq
 
-###################################################################
-###################################################################
-class DynamicPositionalEncoding(nn.Module):
-    def __init__(self, d_model, height, width):
-        """
-        Args:
-            d_model: Feature dimension
-            height: Height of the positional encoding
-            width: Width of the positional encoding
-        """
-        super(DynamicPositionalEncoding, self).__init__()
-        self.height = height
-        self.width = width
-        self.position_embedding = nn.Parameter(torch.zeros(1, d_model, height, width))
-        nn.init.xavier_uniform_(self.position_embedding)  
 
-    def forward(self, x):
-        """
-        Args:
-            x: Input tensor of shape (batch_size, d_model, height, width)
-        Returns:
-            Tensor with positional encoding added
-        """
-        return x + self.position_embedding
 
-###################################################################
-###################################################################
+# class HA(nn.Module):
+#     def __init__(self,
+#                  in_channels=[512, 1024, 1024],
+#                  out_channels=[256, 512, 1024],
+#                  stride = [2, 1, 2], # [1, 1, 1] for vit
+#                  d_model = 512, nhead = 8):
+#         super(HA, self).__init__()
+#         self.fusion3 = InteractorT(d_model=d_model, nhead=nhead)
+#         self.fusion4 = InteractorT(d_model=d_model, nhead=nhead)
+#         self.fusion5 = InteractorT(d_model=d_model, nhead=nhead)     
+#         self.txt_proj = nn.Linear(in_channels[2], out_channels[1])   
+#         self.f3_proj = conv_layer(in_channels[0], out_channels[1], stride[0], 0, stride[0])
+#         self.f4_proj = conv_layer(in_channels[1], out_channels[1], stride[1], 0, stride[1])
+#         self.f5_proj = deconv_layer(in_channels[2], out_channels[1], stride[2], 0, stride[2])
+#         # aggregation
+#         self.aggr = conv_layer(3 * out_channels[1], out_channels[1], 1, 0)
+#         self.coordconv = nn.Sequential(
+#             CoordConv(out_channels[1], out_channels[1], 3, 1),
+#             conv_layer(out_channels[1], out_channels[1], 3, 1))
+
+#     def forward(self, imgs, state):
+#         # v3, v4, v5: 512, 52, 52 / 1024, 26, 26 / 512, 13, 13
+#         v3, v4, v5 = imgs
+#         txt = state.unsqueeze(-1).permute(2, 0, 1)
+#         v3 = self.f3_proj(v3)
+#         v4 = self.f4_proj(v4)
+#         v5 = self.f5_proj(v5)
+#         txt = self.txt_proj(txt)
+#         # fusion v3 
+#         b, c, h, w = v3.shape
+#         v3 = v3.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c
+#         # print(v3.shape, txt.shape)
+#         fq3 = self.fusion3(v3, txt)        
+#         fq3 = fq3.permute(1, 2, 0).reshape(b, c, h, w)
+#         # fusion v4 
+#         b, c, h, w = v4.shape
+#         v4 = v4.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c     
+#         # v4 = self.downsample(v4)
+#         fq4 = self.fusion4(v4, txt)        
+#         fq4 = fq4.permute(1, 2, 0).reshape(b, c, h, w)
+#         # fusion v5 
+#         b, c, h, w = v5.shape
+#         v5 = v5.reshape(b, c, -1).permute(2, 0, 1) # b, c, h, w -> b, c, hw -> hw, b, c       
+#         fq5 = self.fusion5(v5, txt)
+#         fq5 = fq5.permute(1, 2, 0).reshape(b, c, h, w)
+#         # fusion 4: b, 512, 26, 26 / b, 512, 26, 26 / b, 512, 26, 26
+#         # query
+#         fq = torch.cat([fq3, fq4, fq5], dim=1)
+#         fq = self.aggr(fq)
+#         fq = self.coordconv(fq)
+#         # b, 512, 26, 26
+#         return fq
+
 
 class CoordConv(nn.Module):
     def __init__(self,
@@ -234,9 +244,6 @@ class GA(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.return_intermediate = return_intermediate
 
-        self.vis_pos_enc = DynamicPositionalEncoding(d_model, height=26, width=26)
-        self.txt_pos_enc = DynamicPositionalEncoding(d_model, height=1, width=1)
-
     @staticmethod
     def pos1d(d_model, length):
         """
@@ -293,13 +300,6 @@ class GA(nn.Module):
         '''
         B, C, H, W = vis.size()
         _, L, D = txt.size()
-
-        ##############################################################################
-        # DynamicPositionalEncoding 
-        vis = self.vis_pos_enc(vis)
-        txt = self.txt_pos_enc(txt.unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1)
-        ##############################################################################
-        
         # position encoding
         vis_pos = self.pos2d(C, H, W)
         txt_pos = self.pos1d(D, L)
@@ -310,8 +310,7 @@ class GA(nn.Module):
         output = vis
         intermediate = []
         for layer in self.layers:
-            # output = layer(output, txt, vis_pos, txt_pos, pad_mask)
-            output = layer(output, txt, None, None, pad_mask)
+            output = layer(output, txt, vis_pos, txt_pos, pad_mask)
             if self.return_intermediate:
                 # HW, b, 512 -> b, 512, HW
                 intermediate.append(self.norm(output).permute(1, 2, 0))
@@ -392,41 +391,6 @@ class GALayer(nn.Module):
         return vis
 
 
-############################
-############################
-
-class InteractorT2(nn.Module):
-    def __init__(self, d_model, nhead, seq_len=512, k=64, dropout=0.1):
-        super().__init__()
-        self.multihead_attn = Linformer(
-            dim=d_model,
-            seq_len=seq_len,
-            depth=1,
-            heads=nhead,
-            k=k,
-            dropout=dropout
-        )
-        self.dim = d_model
-
-    def forward(self, tgt, memory=None):
-        # print('tgt -> shape', tgt.shape) # 676, 32, 512
-        # print('d_model', self.dim)
-        # print(f"tgt shape: {tgt.shape}")
-        # print(f"memory shape: {memory.shape}")
-
-        if memory is not None:
-            combined_input = torch.cat([tgt, memory], dim=0) 
-        else:
-            combined_input = tgt
-
-        output = self.multihead_attn(combined_input)  
-        return output
-
-
-############################
-############################
-
-
 class InteractorT(nn.Module):
     def __init__(self, d_model, nhead, dropout=0.0):
         super().__init__()
@@ -445,6 +409,10 @@ class InteractorT(nn.Module):
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt * tgt2
         return tgt
+    
+
+
+
 
 
 class Interactor(nn.Module):
